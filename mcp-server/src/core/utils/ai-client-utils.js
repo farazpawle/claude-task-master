@@ -16,6 +16,10 @@ const DEFAULT_MODEL_CONFIG = {
 	temperature: 0.2
 };
 
+// Default OpenRouter models
+const DEFAULT_OPENROUTER_MODEL = 'anthropic/claude-3-7-sonnet-20250219';
+const DEFAULT_OPENROUTER_RESEARCH_MODEL = 'perplexity/sonar-medium-online';
+
 /**
  * Get an Anthropic client instance initialized with MCP session environment variables
  * @param {Object} [session] - Session object from MCP containing environment variables
@@ -82,6 +86,55 @@ export async function getPerplexityClientForMCP(session, log = console) {
 }
 
 /**
+ * Get an OpenRouter client instance initialized with MCP session environment variables
+ * @param {Object} [session] - Session object from MCP containing environment variables
+ * @param {Object} [log] - Logger object to use (defaults to console)
+ * @param {boolean} [forResearch=false] - Whether this client is for research tasks
+ * @returns {Object} Object containing the OpenAI client and the model to use
+ * @throws {Error} If API key is missing or OpenAI package can't be imported
+ */
+export async function getOpenRouterClientForMCP(session, log = console, forResearch = false) {
+	try {
+		// Extract API key from session.env or fall back to environment variables
+		const apiKey =
+			session?.env?.OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY;
+
+		if (!apiKey) {
+			throw new Error(
+				'OPENROUTER_API_KEY not found in session environment or process.env'
+			);
+		}
+
+		// Get the appropriate model based on whether this is for research
+		const model = forResearch
+			? session?.env?.OPENROUTER_RESEARCH_MODEL ||
+			  process.env.OPENROUTER_RESEARCH_MODEL ||
+			  DEFAULT_OPENROUTER_RESEARCH_MODEL
+			: session?.env?.OPENROUTER_MODEL ||
+			  process.env.OPENROUTER_MODEL ||
+			  DEFAULT_OPENROUTER_MODEL;
+
+		// Dynamically import OpenAI (it may not be used in all contexts)
+		const { default: OpenAI } = await import('openai');
+
+		// Initialize a new OpenAI client configured for OpenRouter
+		const client = new OpenAI({
+			apiKey,
+			baseURL: 'https://openrouter.ai/api/v1',
+			defaultHeaders: {
+				'HTTP-Referer': 'https://github.com/eyaltoledano/claude-task-master', // Required by OpenRouter
+				'X-Title': 'Task Master' // Optional, but good practice
+			}
+		});
+
+		return { client, model };
+	} catch (error) {
+		log.error(`Failed to initialize OpenRouter client: ${error.message}`);
+		throw error;
+	}
+}
+
+/**
  * Get model configuration from session environment or fall back to defaults
  * @param {Object} [session] - Session object from MCP containing environment variables
  * @param {Object} [defaults] - Default model configuration to use if not in session
@@ -102,6 +155,7 @@ export function getModelConfig(session, defaults = DEFAULT_MODEL_CONFIG) {
  * @param {Object} options - Options for model selection
  * @param {boolean} [options.requiresResearch=false] - Whether the operation requires research capabilities
  * @param {boolean} [options.claudeOverloaded=false] - Whether Claude is currently overloaded
+ * @param {boolean} [options.useOpenRouter=false] - Whether to prefer OpenRouter over other providers
  * @param {Object} [log] - Logger object to use (defaults to console)
  * @returns {Promise<Object>} Selected model info with type and client
  * @throws {Error} If no AI models are available
@@ -111,21 +165,53 @@ export async function getBestAvailableAIModel(
 	options = {},
 	log = console
 ) {
-	const { requiresResearch = false, claudeOverloaded = false } = options;
+	const {
+		requiresResearch = false,
+		claudeOverloaded = false,
+		useOpenRouter = session?.env?.USE_OPENROUTER === 'true' || process.env.USE_OPENROUTER === 'true'
+	} = options;
 
-	// Test case: When research is needed but no Perplexity, use Claude
+	// Check if OpenRouter is explicitly preferred
+	if (useOpenRouter && (session?.env?.OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY)) {
+		try {
+			// Use research model if this is a research task, otherwise use standard model
+			const forResearch = requiresResearch;
+			log.info(`Using OpenRouter as preferred provider${forResearch ? ' (research mode)' : ''}`);
+			const { client, model } = await getOpenRouterClientForMCP(session, log, forResearch);
+			return { type: 'openrouter', client, model };
+		} catch (error) {
+			log.warn(`OpenRouter not available despite being preferred: ${error.message}`);
+			// Fall through to other options
+		}
+	}
+
+	// Test case: When research is needed but no Perplexity, use Claude or OpenRouter
 	if (
 		requiresResearch &&
-		!(session?.env?.PERPLEXITY_API_KEY || process.env.PERPLEXITY_API_KEY) &&
-		(session?.env?.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY)
+		!(session?.env?.PERPLEXITY_API_KEY || process.env.PERPLEXITY_API_KEY)
 	) {
-		try {
-			log.warn('Perplexity not available for research, using Claude');
-			const client = getAnthropicClientForMCP(session, log);
-			return { type: 'claude', client };
-		} catch (error) {
-			log.error(`Claude not available: ${error.message}`);
-			throw new Error('No AI models available for research');
+		// Try OpenRouter first if available
+		if (session?.env?.OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY) {
+			try {
+				log.warn('Perplexity not available for research, using OpenRouter with research model');
+				const { client, model } = await getOpenRouterClientForMCP(session, log, true);
+				return { type: 'openrouter', client, model };
+			} catch (error) {
+				log.warn(`OpenRouter not available: ${error.message}`);
+				// Fall through to Claude
+			}
+		}
+
+		// Try Claude as fallback
+		if (session?.env?.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY) {
+			try {
+				log.warn('Using Claude for research (Perplexity and OpenRouter not available)');
+				const client = getAnthropicClientForMCP(session, log);
+				return { type: 'claude', client };
+			} catch (error) {
+				log.error(`Claude not available: ${error.message}`);
+				throw new Error('No AI models available for research');
+			}
 		}
 	}
 
@@ -139,26 +225,52 @@ export async function getBestAvailableAIModel(
 			return { type: 'perplexity', client };
 		} catch (error) {
 			log.warn(`Perplexity not available: ${error.message}`);
-			// Fall through to Claude as backup
+			// Fall through to other options
 		}
 	}
 
-	// Test case: Claude for overloaded scenario
-	if (
-		claudeOverloaded &&
-		(session?.env?.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY)
-	) {
-		try {
-			log.warn(
-				'Claude is overloaded but no alternatives are available. Proceeding with Claude anyway.'
-			);
-			const client = getAnthropicClientForMCP(session, log);
-			return { type: 'claude', client };
-		} catch (error) {
-			log.error(
-				`Claude not available despite being overloaded: ${error.message}`
-			);
-			throw new Error('No AI models available');
+	// Handle Claude overloaded scenario
+	if (claudeOverloaded) {
+		// Try OpenRouter as fallback when Claude is overloaded
+		if (session?.env?.OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY) {
+			try {
+				// Use research model if this is a research task, otherwise use standard model
+				const forResearch = requiresResearch;
+				log.info(`Claude is overloaded, using OpenRouter as fallback${forResearch ? ' (research mode)' : ''}`);
+				const { client, model } = await getOpenRouterClientForMCP(session, log, forResearch);
+				return { type: 'openrouter', client, model };
+			} catch (error) {
+				log.warn(`OpenRouter fallback not available: ${error.message}`);
+				// Fall through to Perplexity or Claude
+			}
+		}
+
+		// Try Perplexity as another fallback
+		if (session?.env?.PERPLEXITY_API_KEY || process.env.PERPLEXITY_API_KEY) {
+			try {
+				log.info('Claude is overloaded, falling back to Perplexity');
+				const client = await getPerplexityClientForMCP(session, log);
+				return { type: 'perplexity', client };
+			} catch (error) {
+				log.warn(`Perplexity fallback not available: ${error.message}`);
+				// Fall through to Claude anyway with warning
+			}
+		}
+
+		// Last resort: Use Claude even if overloaded
+		if (session?.env?.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY) {
+			try {
+				log.warn(
+					'Claude is overloaded but no alternatives are available. Proceeding with Claude anyway.'
+				);
+				const client = getAnthropicClientForMCP(session, log);
+				return { type: 'claude', client };
+			} catch (error) {
+				log.error(
+					`Claude not available despite being overloaded: ${error.message}`
+				);
+				throw new Error('No AI models available');
+			}
 		}
 	}
 
@@ -210,4 +322,40 @@ export function handleClaudeError(error) {
 
 	// Default error message
 	return `Error communicating with Claude: ${error.message}`;
+}
+
+/**
+ * Handle OpenAI-compatible API errors with user-friendly messages
+ * Works for both Perplexity and OpenRouter
+ * @param {Error} error - The error from OpenAI-compatible API
+ * @param {string} provider - The provider name (e.g., 'Perplexity', 'OpenRouter')
+ * @returns {string} User-friendly error message
+ */
+export function handleOpenAIError(error, provider = 'API') {
+	// Check if it's a structured error response
+	if (error.error?.type || error.error?.code) {
+		const errorType = error.error.type || error.error.code;
+		switch (errorType) {
+			case 'insufficient_quota':
+			case 'billing_quota_exceeded':
+				return `Your ${provider} quota has been exceeded. Please check your billing status.`;
+			case 'rate_limit_exceeded':
+				return `You have exceeded the ${provider} rate limit. Please wait a few minutes before making more requests.`;
+			case 'invalid_request_error':
+				return `There was an issue with the ${provider} request format. If this persists, please report it as a bug.`;
+			default:
+				return `${provider} error: ${error.error.message || error.message}`;
+		}
+	}
+
+	// Check for network/timeout errors
+	if (error.message?.toLowerCase().includes('timeout')) {
+		return `The request to ${provider} timed out. Please try again.`;
+	}
+	if (error.message?.toLowerCase().includes('network')) {
+		return `There was a network error connecting to ${provider}. Please check your internet connection and try again.`;
+	}
+
+	// Default error message
+	return `Error communicating with ${provider}: ${error.message}`;
 }

@@ -11,8 +11,13 @@ A task management system for AI-driven development with Claude, designed to work
 
 ## Requirements
 
+At least one of the following API keys is required:
 - Anthropic API key (Claude API)
-- OpenAI SDK (for Perplexity API integration, optional)
+- OpenRouter API key
+- Perplexity API key (for research-backed features)
+
+Additional requirements:
+- OpenAI SDK (for Perplexity and OpenRouter integrations)
 
 ## Quick Start
 
@@ -31,8 +36,12 @@ MCP (Model Control Protocol) provides the easiest way to get started with Task M
 			"env": {
 				"ANTHROPIC_API_KEY": "YOUR_ANTHROPIC_API_KEY_HERE",
 				"PERPLEXITY_API_KEY": "YOUR_PERPLEXITY_API_KEY_HERE",
+				"OPENROUTER_API_KEY": "YOUR_OPENROUTER_API_KEY_HERE",
 				"MODEL": "claude-3-7-sonnet-20250219",
 				"PERPLEXITY_MODEL": "sonar-pro",
+				"OPENROUTER_MODEL": "anthropic/claude-3-7-sonnet-20250219",
+				"OPENROUTER_RESEARCH_MODEL": "perplexity/sonar-medium-online",
+				"USE_OPENROUTER": "false",
 				"MAX_TOKENS": "64000",
 				"TEMPERATURE": "0.2",
 				"DEFAULT_SUBTASKS": "5",
